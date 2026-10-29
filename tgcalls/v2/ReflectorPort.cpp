@@ -22,6 +22,7 @@
 #include "rtc_base/strings/string_builder.h"
 #include "system_wrappers/include/field_trial.h"
 #include "rtc_base/byte_order.h"
+#include "rtc_base/socket_adapters.h"
 
 #include "RawTcpSocket.h"
 
@@ -94,7 +95,22 @@ rtc::AsyncPacketSocket *CreateClientRawTcpSocket(
         RTC_LOG(LS_ERROR) << "Setting TCP_NODELAY option failed with error "
         << socket->GetError();
     }
-    
+    if (proxy_info.type == rtc::PROXY_SOCKS5) {
+        socket = new rtc::AsyncSocksProxySocket(
+                socket,
+                proxy_info.address,
+                proxy_info.username,
+                proxy_info.password
+        );
+    } else if (proxy_info.type == rtc::PROXY_HTTPS) {
+        socket = new rtc::AsyncHttpsProxySocket(
+                socket,
+                user_agent,
+                proxy_info.address,
+                proxy_info.username,
+                proxy_info.password
+        );
+    }
     if (socket->Connect(remote_address) < 0) {
         RTC_LOG(LS_ERROR) << "TCP connect failed with error " << socket->GetError();
         delete socket;
