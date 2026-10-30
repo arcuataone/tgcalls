@@ -1,4 +1,8 @@
 #include "v2/NativeNetworkingImpl.h"
+#include <deque>
+#include <cerrno>
+#include "rtc_base/buffer.h"
+#include "rtc_base/socket_adapters.h"
 
 #include "p2p/base/basic_packet_socket_factory.h"
 #include "p2p/client/basic_port_allocator.h"
@@ -163,11 +167,468 @@ private:
     std::unique_ptr<rtc::AsyncPacketSocket> _wrappedSocket;
 };
 
+    class Socks5UdpPacketSocket final : public rtc::AsyncPacketSocket {
+    public:
+        static Socks5UdpPacketSocket *Create(
+                rtc::SocketFactory *factory,
+                const rtc::SocketAddress &localAddress,
+                uint16_t minPort,
+                uint16_t maxPort,
+                const Proxy &proxy) {
+
+            auto *result = new Socks5UdpPacketSocket(factory, proxy);
+
+            if (!result->initialize(localAddress, minPort, maxPort)) {
+                delete result;
+                return nullptr;
+            }
+
+            return result;
+        }
+
+        ~Socks5UdpPacketSocket() override {
+            Close();
+        }
+
+        rtc::SocketAddress GetLocalAddress() const override {
+            if (_udpSocket) {
+                return _udpSocket->GetLocalAddress();
+            }
+            return rtc::SocketAddress();
+        }
+
+        rtc::SocketAddress GetRemoteAddress() const override {
+            return rtc::SocketAddress();
+        }
+
+        int Send(
+                const void *pv,
+                size_t cb,
+                const rtc::PacketOptions &options) override {
+            SetError(EINVAL);
+            return -1;
+        }
+
+        int SendTo(
+                const void *pv,
+                size_t cb,
+                const rtc::SocketAddress &addr,
+                const rtc::PacketOptions &options) override {
+
+            if (!_udpSocket || _closed) {
+                SetError(ENOTCONN);
+                return -1;
+            }
+            if (!_ready) {
+                if (_pending.size() >= 32) {
+                    _pending.pop_front();
+                }
+
+                PendingPacket packet;
+                packet.data.resize(cb);
+                memcpy(packet.data.data(), pv, cb);
+                packet.address = addr;
+                packet.options = options;
+
+                _pending.push_back(std::move(packet));
+
+                // Для вызывающей стороны пакет принят нами в очередь.
+                return static_cast<int>(cb);
+            }
+
+            return sendNow(pv, cb, addr, options);
+        }
+
+        int Close() override {
+            _ready = false;
+            _closed = true;
+            _pending.clear();
+
+            if (_controlSocket) {
+                _controlSocket->SignalConnectEvent.disconnect(this);
+                _controlSocket->SignalCloseEvent.disconnect(this);
+                _controlSocket->Close();
+                _controlSocket.reset();
+            }
+
+            if (_udpSocket) {
+                int result = _udpSocket->Close();
+                _udpSocket.reset();
+                return result;
+            }
+
+            return 0;
+        }
+
+        State GetState() const override {
+            return _udpSocket ? STATE_BOUND : STATE_CLOSED;
+        }
+
+        int GetOption(rtc::Socket::Option opt, int *value) override {
+            if (!_udpSocket) {
+                return -1;
+            }
+
+            return _udpSocket->GetOption(opt, value);
+        }
+
+        int SetOption(rtc::Socket::Option opt, int value) override {
+            if (!_udpSocket) {
+                return -1;
+            }
+
+            return _udpSocket->SetOption(opt, value);
+        }
+
+        int GetError() const override {
+            if (!_udpSocket) {
+                return _error;
+            }
+
+            return _udpSocket->GetError();
+        }
+
+        void SetError(int error) override {
+            _error = error;
+
+            if (_udpSocket) {
+                _udpSocket->SetError(error);
+            }
+        }
+
+    private:
+        struct PendingPacket {
+            std::vector<uint8_t> data;
+            rtc::SocketAddress address;
+            rtc::PacketOptions options;
+        };
+
+        Socks5UdpPacketSocket(
+                rtc::SocketFactory *factory,
+                const Proxy &proxy)
+                : _factory(factory),
+                  _proxy(proxy) {
+        }
+
+        static int bindUdpSocket(
+                rtc::Socket *socket,
+                const rtc::SocketAddress &address,
+                uint16_t minPort,
+                uint16_t maxPort) {
+
+            if (address.port() != 0 || (minPort == 0 && maxPort == 0)) {
+                return socket->Bind(address);
+            }
+
+            for (uint16_t port = minPort; port <= maxPort; ++port) {
+                rtc::SocketAddress candidate(address.ipaddr(), port);
+
+                if (socket->Bind(candidate) == 0) {
+                    return 0;
+                }
+
+                if (port == 65535) {
+                    break;
+                }
+            }
+
+            return -1;
+        }
+
+        bool initialize(
+                const rtc::SocketAddress &localAddress,
+                uint16_t minPort,
+                uint16_t maxPort) {
+
+            // UDP socket, которым физически общаемся с локальным Mieru relay.
+            rtc::Socket *udp =
+                    _factory->CreateSocket(localAddress.family(), SOCK_DGRAM);
+
+            if (!udp) {
+                RTC_LOG(LS_ERROR) << "QiQi SOCKS5 UDP: can't create UDP socket";
+                return false;
+            }
+
+            if (bindUdpSocket(udp, localAddress, minPort, maxPort) < 0) {
+                RTC_LOG(LS_ERROR)
+                << "QiQi SOCKS5 UDP: UDP bind failed: "
+                << udp->GetError();
+
+                delete udp;
+                return false;
+            }
+
+            _udpSocket.reset(udp);
+
+            _udpSocket->SignalReadEvent.connect(
+                    this,
+                    &Socks5UdpPacketSocket::onUdpRead);
+
+            _udpSocket->SignalWriteEvent.connect(
+                    this,
+                    &Socks5UdpPacketSocket::onUdpWrite);
+
+            // TCP control connection SOCKS5 UDP ASSOCIATE.
+            rtc::Socket *control =
+                    _factory->CreateSocket(AF_INET, SOCK_STREAM);
+
+            if (!control) {
+                RTC_LOG(LS_ERROR)
+                << "QiQi SOCKS5 UDP: can't create control socket";
+                return false;
+            }
+
+            rtc::CryptString password(
+                    CryptStringImpl(_proxy.password));
+
+            _controlSocket =
+                    std::make_unique<rtc::AsyncSocksProxySocket>(
+                            control,
+                            rtc::SocketAddress(_proxy.host, _proxy.port),
+                            _proxy.login,
+                            password,
+                            3); // SOCKS5 UDP ASSOCIATE
+
+            _controlSocket->SignalConnectEvent.connect(
+                    this,
+                    &Socks5UdpPacketSocket::onControlConnected);
+
+            _controlSocket->SignalCloseEvent.connect(
+                    this,
+                    &Socks5UdpPacketSocket::onControlClosed);
+
+            // RFC1928: 0.0.0.0:0 означает "дай мне UDP association".
+            in_addr anyAddress{};
+            rtc::IPAddress anyIp(anyAddress);
+
+            const int result = _controlSocket->Connect(
+                    rtc::SocketAddress(anyIp, 0));
+
+            if (result < 0) {
+                RTC_LOG(LS_ERROR)
+                << "QiQi SOCKS5 UDP: control Connect failed: "
+                << _controlSocket->GetError();
+
+                return false;
+            }
+
+            return true;
+        }
+
+        void onControlConnected(rtc::Socket *socket) {
+            const uint16_t relayPort =
+                    _controlSocket->GetBoundPort();
+
+            if (relayPort == 0) {
+                RTC_LOG(LS_ERROR)
+                << "QiQi SOCKS5 UDP: proxy returned port 0";
+                return;
+            }
+
+            // Mieru у нас локальный, поэтому BND.ADDR нам не интересен.
+            // Берём его host и полученный BND.PORT.
+            _relayAddress =
+                    rtc::SocketAddress(_proxy.host, relayPort);
+
+            _ready = true;
+
+            auto pending = std::move(_pending);
+            _pending.clear();
+
+            for (auto &packet : pending) {
+                sendNow(
+                        packet.data.data(),
+                        packet.data.size(),
+                        packet.address,
+                        packet.options);
+            }
+
+            SignalReadyToSend(this);
+        }
+
+        void onControlClosed(rtc::Socket *socket, int error) {
+            RTC_LOG(LS_ERROR)
+            << "QiQi SOCKS5 UDP: control connection closed, error="
+            << error;
+
+            _ready = false;
+            _closed = true;
+            _pending.clear();
+            NotifyClosed(error);
+        }
+
+        int sendNow(
+                const void *pv,
+                size_t cb,
+                const rtc::SocketAddress &destination,
+                const rtc::PacketOptions &options) {
+
+            if (destination.family() != AF_INET) {
+                RTC_LOG(LS_ERROR)
+                << "QiQi SOCKS5 UDP: only IPv4 is implemented";
+
+                SetError(EAFNOSUPPORT);
+                return -1;
+            }
+
+            in_addr ipv4{};
+
+            const std::string ip =
+                    destination.ipaddr().ToString();
+
+            if (inet_pton(AF_INET, ip.c_str(), &ipv4) != 1) {
+                SetError(EINVAL);
+                return -1;
+            }
+
+            // RFC1928 UDP request:
+            //
+            // RSV RSV FRAG ATYP DST.ADDR DST.PORT DATA
+            //
+            std::vector<uint8_t> packet;
+            packet.resize(10 + cb);
+
+            packet[0] = 0;
+            packet[1] = 0;
+            packet[2] = 0; // FRAG
+            packet[3] = 1; // IPv4
+
+            memcpy(packet.data() + 4, &ipv4.s_addr, 4);
+
+            const uint16_t port =
+                    htons(destination.port());
+
+            memcpy(packet.data() + 8, &port, 2);
+
+            memcpy(packet.data() + 10, pv, cb);
+
+            const int result =
+                    _udpSocket->SendTo(
+                            packet.data(),
+                            packet.size(),
+                            _relayAddress);
+
+            if (result < 0) {
+                return -1;
+            }
+
+            rtc::SentPacket sentPacket(
+                    options.packet_id,
+                    rtc::TimeMillis(),
+                    options.info_signaled_after_sent);
+
+            CopySocketInformationToPacketInfo(
+                    cb,
+                    *this,
+                    true,
+                    &sentPacket.info);
+
+            SignalSentPacket(this, sentPacket);
+
+            // WebRTC ожидает размер исходного payload, а не SOCKS envelope.
+            return static_cast<int>(cb);
+        }
+
+        void onUdpRead(rtc::Socket *socket) {
+            RTC_DCHECK(socket == _udpSocket.get());
+
+            rtc::Socket::ReceiveBuffer receiveBuffer(_buffer);
+
+            const int length =
+                    _udpSocket->RecvFrom(receiveBuffer);
+
+            if (length <= 0 || receiveBuffer.source_address != _relayAddress) {
+                return;
+            }
+
+            const auto& payload =
+                    receiveBuffer.payload;
+
+            const uint8_t *data =
+                    payload.data();
+
+            const size_t size =
+                    payload.size();
+
+            // Минимальный IPv4 SOCKS5 UDP header = 10 байт.
+            if (size < 10) {
+                return;
+            }
+
+            if (data[0] != 0 ||
+                data[1] != 0 ||
+                data[2] != 0) {
+                return;
+            }
+
+            // Пока Telegram даёт нам IPv4 endpoints.
+            if (data[3] != 1) {
+                RTC_LOG(LS_WARNING)
+                << "QiQi SOCKS5 UDP: unsupported ATYP="
+                << static_cast<int>(data[3]);
+
+                return;
+            }
+
+            in_addr sourceAddress{};
+            memcpy(&sourceAddress.s_addr, data + 4, 4);
+
+            char addressBuffer[INET_ADDRSTRLEN] = {};
+
+            if (!inet_ntop(
+                    AF_INET,
+                    &sourceAddress,
+                    addressBuffer,
+                    sizeof(addressBuffer))) {
+                return;
+            }
+
+            uint16_t sourcePort;
+            memcpy(&sourcePort, data + 8, 2);
+            sourcePort = ntohs(sourcePort);
+
+            rtc::SocketAddress source(
+                    std::string(addressBuffer),
+                    sourcePort);
+
+            NotifyPacketReceived(rtc::ReceivedPacket::CreateFromLegacy(
+                    data + 10, size - 10, rtc::TimeMicros(), source));
+        }
+
+        void onUdpWrite(rtc::Socket *socket) {
+            if (_ready) {
+                SignalReadyToSend(this);
+            }
+        }
+
+    private:
+        rtc::SocketFactory *_factory = nullptr;
+        Proxy _proxy;
+
+        std::unique_ptr<rtc::Socket> _udpSocket;
+        std::unique_ptr<rtc::AsyncSocksProxySocket> _controlSocket;
+
+        rtc::Buffer _buffer;
+
+        rtc::SocketAddress _relayAddress;
+
+        std::deque<PendingPacket> _pending;
+
+        bool _ready = false;
+        bool _closed = false;
+        int _error = 0;
+    };
 class WrappedBasicPacketSocketFactory : public rtc::PacketSocketFactory {
 public:
-    WrappedBasicPacketSocketFactory(std::unique_ptr<rtc::BasicPacketSocketFactory> &&impl, bool standaloneReflectorMode) :
-    _impl(std::move(impl)),
-    _standaloneReflectorMode(standaloneReflectorMode) {
+    WrappedBasicPacketSocketFactory(
+            std::unique_ptr<rtc::BasicPacketSocketFactory> &&impl,
+            rtc::SocketFactory *rawSocketFactory,
+            const absl::optional<Proxy> &proxy,
+            bool standaloneReflectorMode)
+            : _impl(std::move(impl)),
+              _rawSocketFactory(rawSocketFactory),
+              _proxy(proxy),
+              _standaloneReflectorMode(standaloneReflectorMode) {
     }
 
     virtual ~WrappedBasicPacketSocketFactory() {
@@ -184,7 +645,22 @@ public:
             if (updatedAddress.port() == 12345) {
                 updatedAddress.SetPort(0);
             }
-            return _impl->CreateUdpSocket(updatedAddress, min_port, max_port);
+            if (_proxy) {
+                if (updatedAddress.family() != AF_INET) {
+                    return nullptr;
+                }
+                return Socks5UdpPacketSocket::Create(
+                        _rawSocketFactory,
+                        updatedAddress,
+                        min_port,
+                        max_port,
+                        *_proxy);
+            }
+
+            return _impl->CreateUdpSocket(
+                    updatedAddress,
+                    min_port,
+                    max_port);
         }
     }
     
@@ -215,6 +691,8 @@ public:
     }
 private:
     std::unique_ptr<rtc::BasicPacketSocketFactory> _impl;
+    rtc::SocketFactory *_rawSocketFactory = nullptr;
+    absl::optional<Proxy> _proxy;
     bool _standaloneReflectorMode = false;
 };
 
@@ -512,10 +990,10 @@ _dataChannelMessageReceived(configuration.dataChannelMessageReceived) {
     
     _networkMonitorFactory = PlatformInterface::SharedInstance()->createNetworkMonitorFactory();
     if (getCustomParameterBool(_customParameters, "network_standalone_reflectors")) {
-        _socketFactory = std::make_unique<WrappedBasicPacketSocketFactory>(std::make_unique<rtc::BasicPacketSocketFactory>(_threads->getNetworkThread()->socketserver()), true);
+        _socketFactory = std::make_unique<WrappedBasicPacketSocketFactory>(std::make_unique<rtc::BasicPacketSocketFactory>(_threads->getNetworkThread()->socketserver()), _underlyingSocketFactory, _proxy, true);
         _networkManager = std::make_unique<WrappedNetworkManager>(_networkMonitorFactory.get(), _threads->getNetworkThread()->socketserver());
     } else {
-        _socketFactory = std::make_unique<rtc::BasicPacketSocketFactory>(_threads->getNetworkThread()->socketserver());
+        _socketFactory = std::make_unique<WrappedBasicPacketSocketFactory>(std::make_unique<rtc::BasicPacketSocketFactory>(_threads->getNetworkThread()->socketserver()), _underlyingSocketFactory, _proxy, false);
         _networkManager = std::make_unique<rtc::BasicNetworkManager>(_networkMonitorFactory.get(), _threads->getNetworkThread()->socketserver());
     }
     
@@ -603,6 +1081,16 @@ void NativeNetworkingImpl::resetDtlsSrtpTransport() {
     
     _portAllocator->set_step_delay(cricket::kMinimumStepDelay);
 
+    if (_proxy) {
+        rtc::ProxyInfo proxyInfo;
+        proxyInfo.type = rtc::PROXY_SOCKS5;
+        proxyInfo.address = rtc::SocketAddress(_proxy->host, _proxy->port);
+        proxyInfo.username = _proxy->login;
+        proxyInfo.password = rtc::CryptString(CryptStringImpl(_proxy->password));
+        _portAllocator->set_proxy("t/1.0", proxyInfo);
+        _portAllocator->SetCandidateFilter(cricket::CF_RELAY);
+    }
+
     _portAllocator->set_flags(flags);
     _portAllocator->Initialize();
 
@@ -610,6 +1098,12 @@ void NativeNetworkingImpl::resetDtlsSrtpTransport() {
     std::vector<cricket::RelayServerConfig> turnServers;
 
     for (auto &server : _rtcServers) {
+        // Relay UDP sockets use SOCKS5 UDP ASSOCIATE. Do not gather STUN
+        // addresses directly when a proxy is selected for calls.
+        if (_proxy && !server.isTurn) {
+            continue;
+        }
+
         if (server.isTurn) {
             turnServers.push_back(cricket::RelayServerConfig(
                 rtc::SocketAddress(server.host, server.port),

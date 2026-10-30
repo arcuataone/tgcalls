@@ -1041,7 +1041,7 @@ public:
                 .encryptionKey = encryptionKey,
                 .isOutgoing = isOutgoing,
                 .enableStunMarking = enableStunMarking,
-                .enableTCP = false,
+                .enableTCP = proxy.has_value(),
                 .enableP2P = enableP2P,
                 .rtcServers = rtcServers,
                 .proxy = proxy,
